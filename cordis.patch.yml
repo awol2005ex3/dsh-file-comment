@@ -1,0 +1,10 @@
+# 本插件作为 profile 层贡献的 patch：把插件注册进配置树。
+#
+# Node 半：loader.import('dsh-file-comment') 解析到主入口 lib/index.js，
+# 为纯客户端插件（无宿主端服务），仅提供插件标识。
+# 浏览器半：client-modules（dsh.client 服务）扫描到本包的 dsh.client 声明后，
+# 经 /plugins/<id>/client.js 提供 lib/client.js，浏览器 shell 为同一行名
+# 创建 fiber 并物化客户端模块，挂载"文件评论"功能。
+- insert:
+    - id: file-comment
+      name: dsh-file-comment
