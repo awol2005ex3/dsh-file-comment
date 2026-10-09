@@ -139,22 +139,41 @@ function el<K extends keyof HTMLElementTagNameMap>(
 }
 
 /**
+ * Like `Element.closest`, but crosses Shadow DOM boundaries (DSH uses
+ * Shadow DOM extensively): walks up the parent chain one level at a time and
+ * only hops from a ShadowRoot to its host when the tree edge is reached.
+ * Accepts any node — text-node anchors (the normal case for text selections)
+ * are handled by walking up to their parent element first.
+ */
+function closestAcrossShadow(node: Node | null, selector: string): Element | null {
+  let current: Node | null = node
+  while (current) {
+    if (current instanceof Element) {
+      const hit = current.closest(selector)
+      if (hit) return hit
+    }
+    const parent = current.parentNode
+    if (parent) {
+      current = parent
+      continue
+    }
+    /* tree edge: hop across the Shadow DOM boundary if there is one */
+    const root = current.getRootNode()
+    if (root instanceof ShadowRoot) {
+      current = root.host
+      continue
+    }
+    break
+  }
+  return null
+}
+
+/**
  * Is `node` inside the document-preview area of the right sidebar?
  * Walks up through Shadow DOM boundaries (DSH uses Shadow DOM extensively).
  */
 function inPreviewArea(node: Node | null): boolean {
-  let current: Node | null = node
-  while (current) {
-    if (current instanceof Element && current.closest(PREVIEW_SELECTORS)) return true
-    /* cross Shadow DOM boundary */
-    const root = current.getRootNode()
-    if (root instanceof ShadowRoot) {
-      current = root.host
-    } else {
-      break
-    }
-  }
-  return false
+  return closestAcrossShadow(node, PREVIEW_SELECTORS) !== null
 }
 
 /** Find the active right-sidebar document tab and return its visible title text. */
@@ -247,7 +266,8 @@ function detectLines(sel: Selection): { start: number; end: number } | null {
     : range.commonAncestorContainer.parentElement
   if (!container) return null
 
-  const previewRoot = container.closest('[data-code-preview]') ?? container.closest(PREVIEW_SELECTORS)
+  const previewRoot = closestAcrossShadow(container, '[data-code-preview]')
+    ?? closestAcrossShadow(container, PREVIEW_SELECTORS)
   if (!previewRoot) return null
 
   const walker = doc.createTreeWalker(previewRoot, NodeFilter.SHOW_ELEMENT)
@@ -287,7 +307,9 @@ function updateSelection(): SelectionInfo | null {
   if (!sel || sel.isCollapsed) { currentSelection = null; return null }
 
   const text = sel.toString().trim()
-  if (!text || !inPreviewArea(sel.anchorNode)) { currentSelection = null; return null }
+  /* anchor or focus endpoint may sit inside the preview area (dragged selections) */
+  const inArea = inPreviewArea(sel.anchorNode) || inPreviewArea(sel.focusNode)
+  if (!text || !inArea) { currentSelection = null; return null }
 
   const lines = detectLines(sel)
   currentSelection = {
