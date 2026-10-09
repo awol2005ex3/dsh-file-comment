@@ -66,4 +66,4 @@ dsh-file-comment/
 
 ## License
 
-MIT
+Apache License 2.0
