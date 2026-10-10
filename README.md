@@ -9,7 +9,7 @@
 - 在文件预览（代码、文本、Markdown 等）中选中文本后，自动弹出浮动工具栏
 - **评论并提问**：打开对话框，输入评论后与选中的代码一起格式化发送到聊天输入框
 - **发送到聊天**：直接将选中内容发送到聊天输入框（不附加评论）
-- 格式化输出包含：文件路径、行号范围、代码块、用户评论
+- 格式化输出包含：文件路径、行:列范围、代码块、用户评论
 
 ## 安装
 
@@ -69,6 +69,10 @@ dsh-file-comment/
 | 选择器 | 用途 |
 |--------|------|
 | `[data-code-preview]` | CodeBody 渲染的代码预览容器 |
+| `[data-textpreview-url]` | 文档预览根节点，属性值 = 完整资源地址（`dsh-resource://file/session/<id>/<path>`） |
+| `[data-textpreview-path]` | 预览头部路径标签，`title` 属性 = 完整文件路径 |
+| `div[data-sidebar-right-tab]` / `span[data-sidebar-right-tab]` | 右侧栏 tab 主体 / 标题 chip（同 id，标题为文件 basename） |
+| `pre code > .line` | 代码行（每源码行一个 span；**行号是 CSS counter，不在 DOM 里**，行号 = 序数） |
 | `[data-sidebar-right-session]` | 右侧边栏 session 容器 |
 | `[data-slot="sidebar.right.pane.tab"]` | 右侧边栏 tab 容器 |
 

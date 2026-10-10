@@ -50,6 +50,8 @@ interface SelectionInfo {
   filePath: string
   startLine: number | null
   endLine: number | null
+  startCol: number | null
+  endCol: number | null
 }
 
 /* ── State ── */
@@ -232,32 +234,76 @@ function findActiveDocTab(): HTMLElement | null {
 }
 
 /**
- * Best-effort file path extraction from the active document tab element.
- * Tries several DOM heuristics; returns empty string when nothing found.
- * Searches through Shadow DOM roots as well.
+ * Best-effort file path for a selection anchored in the right sidebar.
+ * Primary sources are the document preview's own DOM (verified against
+ * ui-sidebar-documentpreview): the header PathLabel carries the complete path
+ * in its `title`, and the preview root carries the resource address. Falls
+ * back to the tab chip title (basename at open time) and older heuristics.
+ * Returns empty string when nothing found.
  */
-function getFilePath(): string {
+function getFilePath(anchor: Node | null): string {
+  if (anchor) {
+    /* document preview header: PathLabel `title` = complete path */
+    try {
+      const preview = closestAcrossShadow(anchor, '[data-textpreview-url]')
+      if (preview) {
+        const label = preview.querySelector('[data-textpreview-path]')
+        const path = label?.getAttribute('title') ?? label?.textContent
+        if (path && path.trim()) return path.trim()
+        /* resource address: dsh-resource://file/session/<sessionId>/<path> */
+        const address = preview.getAttribute('data-textpreview-url') ?? ''
+        const mark = address.indexOf('/session/')
+        if (mark !== -1) {
+          const rest = address.slice(mark + '/session/'.length)
+          const cut = rest.indexOf('/')
+          if (cut !== -1) {
+            const raw = rest.slice(cut + 1)
+            try { return decodeURIComponent(raw) } catch { return raw }
+          }
+        }
+      }
+    } catch { /* fall through */ }
+
+    /* tab chip title (basename): the body and its chip share the tab id */
+    try {
+      const body = closestAcrossShadow(anchor, 'div[data-sidebar-right-tab]')
+      const tabId = body?.getAttribute('data-sidebar-right-tab')
+      if (tabId) {
+        const safe = tabId.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+        const chip = doc.querySelector(`span[data-sidebar-right-tab="${safe}"]`)
+        const title = chip?.textContent?.trim()
+        if (title) return title
+      }
+    } catch { /* fall through */ }
+  }
+
+  /* legacy fallbacks: active tab attributes / titles */
   const tab = findActiveDocTab()
-  if (!tab) return ''
+  if (tab) {
+    /* title / label element */
+    const title = tab.querySelector('[title]')
+    if (title?.getAttribute('title')) return title.getAttribute('title')!
 
-  /* title / label element */
-  const title = tab.querySelector('[title]')
-  if (title?.getAttribute('title')) return title.getAttribute('title')!
+    const fileName = tab.querySelector(
+      '[data-file-name], [data-file-path], [data-resource-path], .tab-title, .file-name',
+    )
+    if (fileName?.textContent) return fileName.textContent.trim()
 
-  const fileName = tab.querySelector(
-    '[data-file-name], [data-file-path], [data-resource-path], .tab-title, .file-name',
-  )
-  if (fileName?.textContent) return fileName.textContent.trim()
+    /* tab-info region */
+    const info = tab.querySelector('[data-tab-info], .tab-info, .tab-label')
+    if (info?.textContent) return info.textContent.trim()
 
-  /* tab-info region */
-  const info = tab.querySelector('[data-tab-info], .tab-info, .tab-label')
-  if (info?.textContent) return info.textContent.trim()
+    /* contentId / address data attribute */
+    const withAddr = tab.querySelector('[data-content-id], [data-address]')
+    const addr = withAddr?.getAttribute('data-content-id') ?? withAddr?.getAttribute('data-address') ?? ''
+    if (addr) {
+      try { return new URL(addr).pathname.replace(/^\/session\/[^/]+\//, '/') } catch { return addr }
+    }
 
-  /* contentId / address data attribute */
-  const withAddr = tab.querySelector('[data-content-id], [data-address]')
-  const addr = withAddr?.getAttribute('data-content-id') ?? withAddr?.getAttribute('data-address') ?? ''
-  if (addr) {
-    try { return new URL(addr).pathname.replace(/^\/session\/[^/]+\//, '/') } catch { return addr }
+    /* fallback: visible title text */
+    const txt = tab.querySelector('[data-slot="sidebar.right.pane.tab.title"]')?.textContent
+      ?? tab.querySelector('.title, h3, h4, span')?.textContent
+    if (txt && txt.trim()) return txt.trim()
   }
 
   /* search inside shadow roots */
@@ -274,10 +320,7 @@ function getFilePath(): string {
     }
   }
 
-  /* fallback: visible title text */
-  const txt = tab.querySelector('[data-slot="sidebar.right.pane.tab.title"]')?.textContent
-    ?? tab.querySelector('.title, h3, h4, span')?.textContent
-  return txt?.trim() ?? ''
+  return ''
 }
 
 /** Search all shadow roots in the document for the first element matching `selector`. */
@@ -293,13 +336,23 @@ function findInShadowRoots(selector: string): Element | null {
   return null
 }
 
+/** A line/column span the selection covers inside the preview renderer. */
+interface LineSpan {
+  start: number
+  end: number
+  startCol: number | null
+  endCol: number | null
+}
+
 /**
- * Try to determine which source lines the selection covers.
- * Walks the selection's text nodes inside the preview container, looking for
- * DOM elements that carry line-number metadata (data-line, class patterns).
- * Returns null when line numbers cannot be determined.
+ * Determine which source lines (and columns) the selection covers.
+ * DSH's CodeBlock renders one global `.line` span per source line and paints
+ * the visible numbers with a CSS counter (`counter(source-line)`), so the
+ * numbers are ABSENT from the DOM — lines are `.line` ordinals within their
+ * `<code>` parent (markdown fences restart numbering per block). Falls back
+ * to data-line/class heuristics, then null when nothing matches.
  */
-function detectLines(sel: Selection): { start: number; end: number } | null {
+function detectLines(sel: Selection): LineSpan | null {
   if (!sel.rangeCount) return null
   const range = sel.getRangeAt(0)
   const container = range.commonAncestorContainer instanceof HTMLElement
@@ -311,6 +364,26 @@ function detectLines(sel: Selection): { start: number; end: number } | null {
     ?? closestAcrossShadow(container, PREVIEW_SELECTORS)
   if (!previewRoot) return null
 
+  /* 1. `.line` ordinals (CodeBlock: streaming / plain / settled-shiki arms) */
+  const lines = previewRoot.querySelectorAll('pre code > .line')
+  if (lines.length > 0) {
+    const startEl = lineContaining(range.startContainer, lines)
+      ?? adjacentIntersecting(lines, range, 'first')
+    const endEl = lineContaining(range.endContainer, lines)
+      ?? adjacentIntersecting(lines, range, 'last')
+    const start = startEl === null ? null : ordinalOf(startEl)
+    const end = endEl === null ? null : ordinalOf(endEl)
+    if (start !== null && end !== null) {
+      return {
+        start,
+        end: end < start ? start : end,
+        startCol: columnOf(range, startEl!, 'start'),
+        endCol: columnOf(range, endEl!, 'end'),
+      }
+    }
+  }
+
+  /* 2. legacy: data-line / class patterns (other renderers) */
   const walker = doc.createTreeWalker(previewRoot, NodeFilter.SHOW_ELEMENT)
   let start: number | null = null
   let end: number | null = null
@@ -338,8 +411,63 @@ function detectLines(sel: Selection): { start: number; end: number } | null {
     node = walker.nextNode() as Element | null
   }
 
-  if (start !== null && end !== null) return { start, end }
+  if (start !== null && end !== null) return { start, end, startCol: null, endCol: null }
   return null
+}
+
+/** The `.line` span containing `node`, when it belongs to `lines`. */
+function lineContaining(node: Node | null, lines: NodeListOf<Element>): Element | null {
+  let current: Node | null = node
+  while (current) {
+    if (current instanceof Element && current.classList.contains('line')) {
+      for (let i = 0; i < lines.length; i++) if (lines[i] === current) return current
+      return null
+    }
+    current = current.parentNode
+  }
+  return null
+}
+
+/** First/last `.line` span the range intersects (boundary-node fallback). */
+function adjacentIntersecting(lines: NodeListOf<Element>, range: Range, edge: 'first' | 'last'): Element | null {
+  if (edge === 'first') {
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]!
+      if (range.intersectsNode(line)) return line
+    }
+  } else {
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i]!
+      if (range.intersectsNode(line)) return line
+    }
+  }
+  return null
+}
+
+/** 1-based line number: the span's ordinal among its `<code>` parent's children. */
+function ordinalOf(line: Element): number | null {
+  const parent = line.parentElement
+  if (!parent) return null
+  const siblings = parent.children
+  for (let i = 0; i < siblings.length; i++) if (siblings[i] === line) return i + 1
+  return null
+}
+
+/** 1-based column of one range boundary inside a line span; null when outside. */
+function columnOf(range: Range, line: Element, side: 'start' | 'end'): number | null {
+  try {
+    const probe = doc.createRange()
+    if (side === 'start') {
+      probe.setStart(line, 0)
+      probe.setEnd(range.startContainer, range.startOffset)
+    } else {
+      probe.setStart(range.endContainer, range.endOffset)
+      probe.setEnd(line, line.childNodes.length)
+    }
+    return probe.toString().length + 1
+  } catch {
+    return null
+  }
 }
 
 /** Read the current browser selection if it falls inside the preview area. */
@@ -355,9 +483,11 @@ function updateSelection(): SelectionInfo | null {
   const lines = detectLines(sel)
   currentSelection = {
     text,
-    filePath: getFilePath(),
+    filePath: getFilePath(sel.anchorNode),
     startLine: lines?.start ?? null,
     endLine: lines?.end ?? null,
+    startCol: lines?.startCol ?? null,
+    endCol: lines?.endCol ?? null,
   }
   return currentSelection
 }
@@ -455,9 +585,8 @@ function showDialog(info: SelectionInfo): void {
   /* body */
   const metaParts: string[] = []
   if (info.filePath) metaParts.push('\u{1F4C4} ' + info.filePath)
-  if (info.startLine !== null) {
-    metaParts.push('\u884C ' + info.startLine + (info.endLine !== null && info.endLine !== info.startLine ? '-' + info.endLine : ''))
-  }
+  const rangeLabel = lineRangeLabel(info)
+  if (rangeLabel) metaParts.push(rangeLabel)
   const meta = el('div', { style: META_CSS })
   meta.textContent = metaParts.join('  |  ') || '(\u672A\u77E5\u6587\u4EF6)'
 
@@ -518,6 +647,23 @@ function hideDialog(): void {
  * Composer integration
  * ────────────────────────────────────────────────────────── */
 
+/** Human label for the selected span: `行 12:5-14:20` / `行 12-14` / `行 12`. */
+function lineRangeLabel(info: SelectionInfo): string {
+  if (info.startLine === null) return ''
+  const sc = info.startCol
+  const ec = info.endCol
+  const endLine = info.endLine ?? info.startLine
+  const hasCols = sc !== null && ec !== null
+  if (endLine === info.startLine) {
+    return hasCols
+      ? '\u884C ' + info.startLine + ':' + sc + '-' + info.startLine + ':' + ec
+      : '\u884C ' + info.startLine
+  }
+  return hasCols
+    ? '\u884C ' + info.startLine + ':' + sc + '-' + endLine + ':' + ec
+    : '\u884C ' + info.startLine + '-' + endLine
+}
+
 /** Format the selection + optional comment into a structured message. */
 function formatMessage(info: SelectionInfo, comment: string): string {
   const parts: string[] = []
@@ -525,10 +671,8 @@ function formatMessage(info: SelectionInfo, comment: string): string {
   /* header: file + lines */
   let header = ''
   if (info.filePath) header += '\u{1F4C4} `' + info.filePath + '`'
-  if (info.startLine !== null) {
-    header += (header ? ' ' : '') + '\u2014 \u884C ' + info.startLine
-    if (info.endLine !== null && info.endLine !== info.startLine) header += '-' + info.endLine
-  }
+  const range = lineRangeLabel(info)
+  if (range) header += (header ? ' ' : '') + '\u2014 ' + range
   if (header) parts.push(header)
 
   /* selected code */

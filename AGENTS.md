@@ -77,6 +77,6 @@ npm run build        # tsc → lib/ + wrap-client.mjs 包装浏览器 bundle
 | 事项 | 现状 / 入口 |
 |------|------|
 | 单元测试 | vitest 未安装、无 `test/` 目录。需要时 `npm i -D vitest`，用例放 `test/**/*.test.ts`（`vitest.config.ts` 已配好 include 与 host 绑定） |
-| 行号检测 | `detectLines` 依赖 `data-line` / class 行号模式；识别不到时仅缺行号，不影响发送 |
+| 行号 / 列号检测 | `detectLines` 数预览内 `pre code > .line` 的**序数**（DSH 行号是 CSS counter，DOM 里没有数字）并用 Range 探针算列号；识别不到时回退 `data-line`/class 启发式，仍失败仅缺行号，不影响发送 |
 | iframe 内容 | 不支持（仅监听主文档 `selectionchange`）；若日志完全无 `sel:` 输出且插件已加载，按此方向排查 |
 | 发送失败 | 静默回退剪贴板，可扩展可见的错误提示 / 重试 |
