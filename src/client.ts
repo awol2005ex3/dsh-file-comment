@@ -11,8 +11,8 @@
  * when the browser shell materializes the fiber.
  *
  * No import/export statements (except the final module.exports assignment)
- * so the wrap script can cleanly enclose the body. All types are `any` to
- * avoid external d.ts imports.
+ * so the wrap script can cleanly enclose the body. Types are declared
+ * locally to avoid external d.ts imports.
  *
  * Feature:
  *   - Listen for text selection in the right-sidebar document preview
@@ -57,6 +57,47 @@ interface SelectionInfo {
 let currentSelection: SelectionInfo | null = null
 let toolbarVisible = false
 let dialogVisible = false
+
+/* ── Composer slot capture (official conversation.input API) ── */
+
+/** Minimal face of the stable public input actions exposed to session-scope slots. */
+interface ComposerInputActions {
+  captureInsertion(): unknown
+  insertText(text: string, span: unknown): boolean
+}
+
+let pluginCtx: any = null
+let capturedInputActions: ComposerInputActions | null = null
+let composerSlotInjected = false
+
+/**
+ * Passively occupy `conversation.input.activity` (kind: single, scope: session)
+ * to capture the active composer's InputActions — the official plugin channel
+ * (see dsh fixture apps/web/tests/fixtures/plugins/fixture-input-extension).
+ * The render body only stores props.inputActions and renders nothing.
+ * Idempotent; called again on the first send in case the `slots` service was
+ * not yet available when apply() ran (boot ordering).
+ */
+function ensureComposerSlot(): void {
+  if (composerSlotInjected || !pluginCtx) return
+  try {
+    /* ctx.get bypasses cordis 4's strict inject check on property access */
+    const slots = pluginCtx.get?.('slots')
+    if (!slots || typeof slots.inject !== 'function') return
+    composerSlotInjected = true
+    slots.inject('conversation.input.activity', () => slots.register(
+      { name: 'conversation.input.activity' },
+      (props: any) => {
+        if (props && props.inputActions) capturedInputActions = props.inputActions as ComposerInputActions
+        /* render nothing; the slot machinery's error boundary tolerates null */
+        return null
+      },
+    ))
+  } catch {
+    /* leave the flag false so the next send retries */
+    composerSlotInjected = false
+  }
+}
 
 /* ──────────────────────────────────────────────────────────
  * Styles
@@ -502,20 +543,102 @@ function formatMessage(info: SelectionInfo, comment: string): string {
   return parts.join('\n')
 }
 
-/** Paste formatted text into the conversation composer via connection.rpc. */
+/**
+ * Locate the visible main chat composer: DSH's composer binds a Lexical editor
+ * to a contenteditable root. Prefers the lowest such element on screen (the
+ * composer bar sits at the bottom) and skips right-sidebar panes.
+ */
+function findComposerElement(): HTMLElement | null {
+  const nodes = doc.querySelectorAll('[contenteditable="true"]')
+  let best: HTMLElement | null = null
+  let bestTop = -1
+  for (let i = 0; i < nodes.length; i++) {
+    const node = nodes[i]!
+    if (!(node instanceof HTMLElement)) continue
+    const rect = node.getBoundingClientRect()
+    if (rect.width < 40 || rect.height < 16) continue
+    /* the right sidebar hosts its own panes; the chat composer is in the main area */
+    if (closestAcrossShadow(node, PREVIEW_SELECTORS)) continue
+    if (rect.top > bestTop) { bestTop = rect.top; best = node }
+  }
+  return best
+}
+
+/**
+ * Insert text through the composer's own paste pipeline (multiline →
+ * paragraphs, undo integrated), with execCommand as the fallback. Returns
+ * whether an insertion path consumed the text.
+ */
+function pasteIntoComposer(text: string): boolean {
+  const target = findComposerElement()
+  if (!target) return false
+  target.focus()
+  /* synthetic paste event: Lexical's DOM paste listener reads clipboardData */
+  try {
+    const data = new DataTransfer()
+    data.setData('text/plain', text)
+    const event = new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true })
+    /* dispatchEvent === false → preventDefault → a handler consumed the paste */
+    if (!target.dispatchEvent(event)) return true
+  } catch { /* DataTransfer / ClipboardEvent may be unavailable */ }
+  /* fallback: execCommand keeps the editor's undo integration */
+  try {
+    return doc.execCommand('insertText', false, text)
+  } catch {
+    return false
+  }
+}
+
+/** Deliver formatted text to the conversation composer; layered fallbacks, each isolated. */
 async function sendToComposer(info: SelectionInfo, comment: string): Promise<void> {
   const text = formatMessage(info, comment)
 
+  /* 1. Official channel: InputActions captured from the composer activity slot
+   *    (revision-guarded, undo-integrated, newlines split paragraphs). */
   try {
-    /* Try connection.rpc first (standard dsh channel) */
+    ensureComposerSlot()
+    const actions = capturedInputActions
+    if (actions) {
+      const span = actions.captureInsertion()
+      if (span != null && actions.insertText(text, span)) {
+        /* eslint-disable-next-line no-console */
+        console.debug('[dsh-file-comment] sent via conversation.input slot')
+        return
+      }
+    }
+  } catch (err) {
+    /* eslint-disable-next-line no-console */
+    console.debug('[dsh-file-comment] slot insert unavailable:', err)
+  }
+
+  /* 2. DOM paste into the visible main composer (the app's own paste pipeline). */
+  try {
+    if (pasteIntoComposer(text)) {
+      /* eslint-disable-next-line no-console */
+      console.debug('[dsh-file-comment] sent via composer paste event')
+      return
+    }
+  } catch (err) {
+    /* eslint-disable-next-line no-console */
+    console.debug('[dsh-file-comment] composer paste failed:', err)
+  }
+
+  /* 3. Legacy: connection.rpc (only reachable if a connection was cached). */
+  try {
     const conn = getConnection()
     if (conn?.rpc?.call) {
       await conn.rpc.call('/api', 'conversation/input-paste', { args: { text } })
+      /* eslint-disable-next-line no-console */
+      console.debug('[dsh-file-comment] sent via connection.rpc')
       return
     }
+  } catch (err) {
+    /* eslint-disable-next-line no-console */
+    console.debug('[dsh-file-comment] connection.rpc failed:', err)
+  }
 
-    /* Fallback: try to find SessionInput via the Cordis context exposed on the DOM.
-     * Some dsh builds expose ctx on a global; this is best-effort. */
+  /* 4. Legacy: Cordis context exposed on a global (best-effort, some builds). */
+  try {
     const globalCtx = (win as unknown as Record<string, any>).__dshContext
     if (globalCtx?.conversation?.input) {
       const sessionId = globalCtx.sidebarRight?.mounted?.getSnapshot?.()
@@ -525,19 +648,24 @@ async function sendToComposer(info: SelectionInfo, comment: string): Promise<voi
           const input = globalCtx.conversation.input.for(sessionCtx)
           input.focus()
           input.paste(text)
+          /* eslint-disable-next-line no-console */
+          console.debug('[dsh-file-comment] sent via __dshContext')
           return
         }
       }
     }
-
-    /* Last resort: clipboard (user can paste manually) */
-    try {
-      await navigator.clipboard.writeText(text)
-    } catch {
-      /* clipboard API may not be available */
-    }
   } catch (err) {
-    /* silent: the user can retry */
+    /* eslint-disable-next-line no-console */
+    console.debug('[dsh-file-comment] __dshContext paste failed:', err)
+  }
+
+  /* 5. Last resort: clipboard (user can paste manually). */
+  try {
+    await navigator.clipboard.writeText(text)
+    /* eslint-disable-next-line no-console */
+    console.debug('[dsh-file-comment] composer not reached — text copied to clipboard')
+  } catch {
+    /* clipboard API may not be available */
   }
 }
 
@@ -643,13 +771,18 @@ function apply(ctx: any): void {
   if ((win as unknown as Record<string, any>)[BUILD_GUARD_KEY] === true) return
   ;(win as unknown as Record<string, any>)[BUILD_GUARD_KEY] = true
 
-  /* connection is optional — cache if available, but don't block on it */
+  /* connection is optional — resolve via ctx.get (a bare ctx.connection property
+   * access throws under cordis 4 strict inject rules, silently killing the cache) */
   try {
-    const conn = ctx?.connection
+    const conn = typeof ctx?.get === 'function' ? ctx.get('connection') : ctx?.connection
     if (conn?.rpc && typeof conn.rpc.call === 'function') {
       ;(win as unknown as Record<string, any>).__dshConnection = conn
     }
   } catch { /* connection may not be available yet */ }
+
+  /* capture the official composer input actions (non-fatal; retried on send) */
+  pluginCtx = ctx
+  try { ensureComposerSlot() } catch { /* slots service may not be up yet */ }
 
   try { init() } catch (err) {
     /* never let init failure silently kill the plugin */
